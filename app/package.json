@@ -1,26 +1,32 @@
 {
   "name": "app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:app": "tauri build --bundles app",
-    "build:desktop": "tauri build && ./scripts/repack-dmg-alias.sh",
+    "build:app": "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" TAURI_SIGNING_PRIVATE_KEY=\"${TAURI_SIGNING_PRIVATE_KEY:-$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.skill-hub/updater.key})}\" tauri build --bundles app",
+    "build:desktop": "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" TAURI_SIGNING_PRIVATE_KEY=\"${TAURI_SIGNING_PRIVATE_KEY:-$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.skill-hub/updater.key})}\" tauri build && ./scripts/repack-dmg-alias.sh",
     "format:check": "cd src-tauri && cargo fmt -- --check",
     "install:local": "npm run build:app && ./scripts/install-local-app.sh",
     "lint": "tsc --noEmit",
+    "release:latest-json": "node scripts/generate-latest-json.cjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.3.1",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
+    "lucide-react": "^1.21.0",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

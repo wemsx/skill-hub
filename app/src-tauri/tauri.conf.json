@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Skill Hub",
-  "version": "0.1.0",
+  "productName": "Skill-Hub",
+  "version": "0.2.0",
   "identifier": "com.jerry.skillhub",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -24,6 +24,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "macOS": {
       "dmg": {
         "background": "assets/dmg-background.png",
@@ -48,5 +49,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIwOUEyRjE0NzcyRTE1MkMKUldRc0ZTNTNGQythc092Y2FtN3lrSUVseG4xeFhJWVBkZ3BUbVVZSnBQeEYxL244VFhXRlpjb2UK",
+      "endpoints": [
+        "https://github.com/JerryLiu-uestc/skill-hub/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

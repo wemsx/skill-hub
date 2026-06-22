@@ -45,6 +45,20 @@ const resources: SkillResource[] = [
     sourceUrl: null,
     updateStatus: "Manual",
   },
+  {
+    id: "codex-plugin-runtime",
+    name: "Runtime Plugin",
+    kind: "plugin",
+    host: "codex",
+    status: "ready",
+    path: "/tmp/codex/plugins/cache/openai-primary-runtime/runtime",
+    summary: "Bundled runtime plugin",
+    compatibility: ["codex"],
+    warnings: [],
+    sourceKind: "registry",
+    sourceUrl: null,
+    updateStatus: "Official",
+  },
 ];
 
 describe("filterInventory", () => {
@@ -53,21 +67,30 @@ describe("filterInventory", () => {
       kind: "plugin",
       host: "codex",
       source: "all",
-      query: "durable",
+      query: "notes",
     });
 
     expect(result.map((resource) => resource.id)).toEqual(["codex-plugin-notes"]);
   });
 
-  it("matches text across name, summary, path, and warnings", () => {
+  it("matches free text against resource names only", () => {
     const result = filterInventory(resources, {
+      kind: "all",
+      host: "all",
+      source: "all",
+      query: "deploy",
+    });
+
+    expect(result.map((resource) => resource.id)).toEqual(["claude-plugin-deploy"]);
+
+    const summaryOnly = filterInventory(resources, {
       kind: "all",
       host: "all",
       source: "all",
       query: "missing",
     });
 
-    expect(result.map((resource) => resource.id)).toEqual(["claude-plugin-deploy"]);
+    expect(summaryOnly).toEqual([]);
   });
 
   it("filters by source kind before applying free text search", () => {
@@ -79,5 +102,16 @@ describe("filterInventory", () => {
     });
 
     expect(result.map((resource) => resource.id)).toEqual(["claude-plugin-deploy"]);
+  });
+
+  it("groups official source filters across native and registry resources", () => {
+    const result = filterInventory(resources, {
+      kind: "all",
+      host: "all",
+      source: "native",
+      query: "",
+    });
+
+    expect(result.map((resource) => resource.id)).toEqual(["codex-skill-review", "codex-plugin-runtime"]);
   });
 });
