@@ -110,9 +110,56 @@ pub struct GitHubSourceMatch {
 #[derive(Clone, Debug)]
 struct GitHubIndexEntry {
     name: String,
+    kind: ResourceKind,
     summary: Option<String>,
     source_url: String,
     skill_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketEntry {
+    pub name: String,
+    pub kind: ResourceKind,
+    pub summary: Option<String>,
+    pub source_url: String,
+    pub skill_sha256: Option<String>,
+    pub installed: bool,
+    pub installed_id: Option<String>,
+    /// `owner/repo` the skill lives in, for grouping and display.
+    pub repo: Option<String>,
+    /// Stargazers of the source repo. GitHub has no per-skill metric, so every
+    /// skill from the same repo shares this number (surfaced as the leaderboard).
+    pub stars: Option<u64>,
+    /// `official` (curated), `community` (discovered), or `index` (legacy JSON).
+    pub origin: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketResult {
+    pub entries: Vec<MarketEntry>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheck {
+    pub status: String,
+    pub source_url: String,
+    pub local_sha256: Option<String>,
+    pub remote_sha256: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Parsed GitHub source URL: owner/repo plus an optional pinned branch and
+/// in-repo subpath (from `/tree/<branch>/<subpath>` style links).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubRef {
+    owner: String,
+    repo: String,
+    branch: Option<String>,
+    subpath: Option<String>,
 }
 
 #[derive(Debug)]
@@ -213,6 +260,125 @@ fn match_github_sources(
     resources: Vec<SkillResource>,
 ) -> Result<Vec<GitHubSourceMatch>, String> {
     match_resources_with_github_indexes(&index_urls, &resources).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn browse_market(
+    index_urls: Vec<String>,
+    resources: Vec<SkillResource>,
+) -> Result<Vec<MarketEntry>, String> {
+    browse_market_entries(&index_urls, &resources).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn discover_market(
+    sources: Vec<String>,
+    token: Option<String>,
+    include_curated: Option<bool>,
+    resources: Vec<SkillResource>,
+) -> Result<MarketResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (entries, warnings) = browse_market_v2(
+            &sources,
+            token.as_deref(),
+            include_curated.unwrap_or(true),
+            &resources,
+        );
+        Ok(MarketResult { entries, warnings })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn discover_repo(
+    source: String,
+    token: Option<String>,
+    resources: Vec<SkillResource>,
+) -> Result<MarketResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Discover a single pasted repo/skill URL (no curated catalog mixed in).
+        let (entries, warnings) = browse_market_v2(
+            std::slice::from_ref(&source),
+            token.as_deref(),
+            false,
+            &resources,
+        );
+        Ok(MarketResult { entries, warnings })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn install_github_skill(
+    source: String,
+    host: HostKind,
+    root: String,
+    kind: ResourceKind,
+    name: String,
+) -> Result<(), String> {
+    install_github_resource(
+        &source,
+        &HostRoot::new(host, expand_home(PathBuf::from(root))),
+        kind,
+        &name,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn discover_market_source(
+    source: String,
+    token: Option<String>,
+    resources: Vec<SkillResource>,
+) -> Result<MarketResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (entries, warnings) = browse_market_v2(
+            &[source],
+            token.as_deref(),
+            false,
+            &resources,
+        );
+        Ok(MarketResult { entries, warnings })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn discover_curated_catalog(
+    resources: Vec<SkillResource>,
+) -> Result<MarketResult, String> {
+    let (entries, warnings) = browse_market_v2(&[], None, true, &resources);
+    Ok(MarketResult { entries, warnings })
+}
+
+#[tauri::command]
+fn check_skill_update(source: String, path: String) -> Result<UpdateCheck, String> {
+    check_github_update(&source, &expand_home(PathBuf::from(path)))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_github_skill(
+    source: String,
+    host: HostKind,
+    root: String,
+    kind: ResourceKind,
+    name: String,
+    path: String,
+) -> Result<(), String> {
+    let mut trash = SystemTrash;
+    update_github_resource(
+        &source,
+        &HostRoot::new(host, expand_home(PathBuf::from(root))),
+        kind,
+        &name,
+        &expand_home(PathBuf::from(path)),
+        &mut trash,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn configured_roots(codex_root: Option<String>, claude_root: Option<String>) -> Vec<HostRoot> {
@@ -392,8 +558,11 @@ fn push_resource(
 fn is_supported_resource(path: &Path, host: HostKind, kind: ResourceKind) -> bool {
     match (host, kind) {
         (_, ResourceKind::Skill) => path.join("SKILL.md").is_file(),
-        (HostKind::Codex, ResourceKind::Plugin) => path.join(".codex-plugin/plugin.json").is_file(),
-        (HostKind::Claude, ResourceKind::Plugin) => path.join("plugin.json").is_file(),
+        (HostKind::Codex, ResourceKind::Plugin) => path.join(".codex-plugin/plugin.json").is_file()
+            || path.join(".claude-plugin/plugin.json").is_file()
+            || path.join("plugin.json").is_file(),
+        (HostKind::Claude, ResourceKind::Plugin) => path.join(".claude-plugin/plugin.json").is_file()
+            || path.join("plugin.json").is_file(),
         (_, ResourceKind::Unknown) => false,
     }
 }
@@ -411,12 +580,18 @@ fn resource_metadata(path: &Path, kind: ResourceKind) -> ResourceMetadata {
 fn parse_plugin_metadata(path: &Path) -> ResourceMetadata {
     let manifest_path = if path.join(".codex-plugin/plugin.json").is_file() {
         path.join(".codex-plugin/plugin.json")
+    } else if path.join(".claude-plugin/plugin.json").is_file() {
+        path.join(".claude-plugin/plugin.json")
     } else {
         path.join("plugin.json")
     };
     let Ok(contents) = fs::read_to_string(manifest_path) else {
         return ResourceMetadata::default();
     };
+    parse_plugin_manifest_metadata(&contents)
+}
+
+fn parse_plugin_manifest_metadata(contents: &str) -> ResourceMetadata {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
         return ResourceMetadata::default();
     };
@@ -498,15 +673,15 @@ fn fallback_summary_for(kind: ResourceKind) -> String {
 }
 
 fn source_kind_for(root: &Path, path: &Path, source_url: &Option<String>) -> SourceKind {
-    if source_url
+    if is_native_resource(path) {
+        SourceKind::Native
+    } else if is_registry_resource(path) {
+        SourceKind::Registry
+    } else if source_url
         .as_ref()
         .is_some_and(|url| url.contains("github.com"))
     {
         SourceKind::GitHub
-    } else if is_native_resource(path) {
-        SourceKind::Native
-    } else if is_registry_resource(path) {
-        SourceKind::Registry
     } else if !path.starts_with(root) {
         SourceKind::Linked
     } else {
@@ -525,12 +700,14 @@ fn update_status_for(source_kind: SourceKind) -> &'static str {
 }
 
 fn is_native_resource(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .windows(2)
         .any(|window| window[0] == "skills" && window[1] == ".system")
-        || path.to_string_lossy().contains("/openai-bundled/")
+        || raw.contains("/openai-bundled/")
+        || raw.contains("/openai-primary-runtime/")
 }
 
 fn is_registry_resource(path: &Path) -> bool {
@@ -648,17 +825,1062 @@ fn match_resources_with_entries(
     matches
 }
 
+pub fn browse_market_entries(
+    index_urls: &[String],
+    resources: &[SkillResource],
+) -> HubResult<Vec<MarketEntry>> {
+    let mut candidates = Vec::new();
+    for url in index_urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| !url.is_empty())
+    {
+        for entry in fetch_github_index(url)? {
+            candidates.push(MarketCandidate::from_index_entry(entry));
+        }
+    }
+    Ok(assemble_market(candidates, resources))
+}
+
+/// An un-deduped, un-marked market item produced by any source: the curated
+/// catalog, live repo discovery, or a legacy index JSON.
+#[derive(Clone, Debug)]
+struct MarketCandidate {
+    name: String,
+    kind: ResourceKind,
+    summary: Option<String>,
+    source_url: String,
+    skill_sha256: Option<String>,
+    repo: Option<String>,
+    stars: Option<u64>,
+    origin: String,
+}
+
+impl MarketCandidate {
+    fn from_index_entry(entry: GitHubIndexEntry) -> Self {
+        let repo = parse_github_ref(&entry.source_url)
+            .ok()
+            .map(|github_ref| format!("{}/{}", github_ref.owner, github_ref.repo));
+        Self {
+            name: entry.name,
+            kind: entry.kind,
+            summary: entry.summary,
+            source_url: entry.source_url,
+            skill_sha256: entry.skill_sha256,
+            repo,
+            stars: None,
+            origin: "index".to_string(),
+        }
+    }
+}
+
+/// Dedupe candidates by source URL, mark which are already installed, and sort
+/// by stars (desc) then name. Pure (only reads already-installed resources) so
+/// it is unit-testable without any network.
+fn assemble_market(
+    candidates: Vec<MarketCandidate>,
+    resources: &[SkillResource],
+) -> Vec<MarketEntry> {
+    let installed_resources: Vec<&SkillResource> = resources
+        .iter()
+        .filter(|resource| matches!(resource.kind, ResourceKind::Skill | ResourceKind::Plugin))
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut market = Vec::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.source_url.clone()) {
+            continue;
+        }
+        let entry_name = candidate.name.to_ascii_lowercase();
+        let entry_hash = candidate
+            .skill_sha256
+            .as_ref()
+            .map(|hash| hash.to_ascii_lowercase());
+        let installed = installed_resources.iter().find(|resource| {
+            if resource.kind != candidate.kind {
+                return false;
+            }
+            if resource.source_url.as_deref() == Some(candidate.source_url.as_str()) {
+                return true;
+            }
+            if candidate.kind == ResourceKind::Skill {
+                if let Some(hash) = &entry_hash {
+                    if let Ok(local) = file_sha256(&resource.path.join("SKILL.md")) {
+                        if local.eq_ignore_ascii_case(hash) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            resource.name.to_ascii_lowercase() == entry_name
+        });
+
+        market.push(MarketEntry {
+            name: candidate.name,
+            kind: candidate.kind,
+            summary: candidate.summary,
+            source_url: candidate.source_url,
+            skill_sha256: candidate.skill_sha256,
+            installed: installed.is_some(),
+            installed_id: installed.map(|resource| resource.id.clone()),
+            repo: candidate.repo,
+            stars: candidate.stars,
+            origin: candidate.origin,
+        });
+    }
+    sort_market(&mut market);
+    market
+}
+
+/// Leaderboard ordering: higher stars first, then name. Entries without a star
+/// count sort after those with one.
+fn sort_market(market: &mut [MarketEntry]) {
+    market.sort_by(|left, right| {
+        right
+            .stars
+            .unwrap_or(0)
+            .cmp(&left.stars.unwrap_or(0))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+}
+
+/// Curated, offline-safe catalog of the official anthropics/skills set. Names
+/// and one-line summaries are baked in so the Market shows real content on first
+/// open even when the GitHub API is rate-limited. Paths are stable and verified.
+const CURATED_OFFICIAL: &[(&str, &str)] = &[
+    (
+        "algorithmic-art",
+        "Create algorithmic art with p5.js, seeded randomness, and interactive parameters.",
+    ),
+    (
+        "brand-guidelines",
+        "Apply Anthropic's official brand colors and typography to artifacts.",
+    ),
+    (
+        "canvas-design",
+        "Create visual art in .png and .pdf documents using a design philosophy.",
+    ),
+    (
+        "claude-api",
+        "Guidance and helpers for working with the Claude API.",
+    ),
+    (
+        "doc-coauthoring",
+        "Guide users through a structured workflow for co-authoring documentation.",
+    ),
+    (
+        "docx",
+        "Create, read, edit, and manipulate Word documents (.docx files).",
+    ),
+    (
+        "frontend-design",
+        "Guidance for distinctive, intentional visual design when building UI.",
+    ),
+    (
+        "internal-comms",
+        "Resources to help write all kinds of internal communications.",
+    ),
+    (
+        "mcp-builder",
+        "Build high-quality MCP servers that let LLMs interact with external services.",
+    ),
+    (
+        "pdf",
+        "Read, extract, merge, split, fill, encrypt, and OCR PDF files.",
+    ),
+    (
+        "pptx",
+        "Create, read, and edit PowerPoint presentations (.pptx files).",
+    ),
+    (
+        "skill-creator",
+        "Create new skills, improve existing ones, and measure skill performance.",
+    ),
+    (
+        "slack-gif-creator",
+        "Create animated GIFs optimized for Slack.",
+    ),
+    (
+        "theme-factory",
+        "Toolkit for styling artifacts with a theme.",
+    ),
+    (
+        "web-artifacts-builder",
+        "Build elaborate, multi-component claude.ai HTML artifacts.",
+    ),
+    (
+        "webapp-testing",
+        "Interact with and test local web applications using Playwright.",
+    ),
+    ("xlsx", "Create, read, and edit spreadsheet files (.xlsx)."),
+];
+
+const OFFICIAL_REPO: &str = "anthropics/skills";
+const MARKET_DISCOVERY_HTTP_TIMEOUT_SECS: u64 = 8;
+
+fn curated_official_candidates() -> Vec<MarketCandidate> {
+    CURATED_OFFICIAL
+        .iter()
+        .map(|(name, summary)| MarketCandidate {
+            name: name.to_string(),
+            kind: ResourceKind::Skill,
+            summary: Some(summary.to_string()),
+            source_url: format!("https://github.com/{OFFICIAL_REPO}/tree/main/skills/{name}"),
+            skill_sha256: None,
+            repo: Some(OFFICIAL_REPO.to_string()),
+            stars: None,
+            origin: "official".to_string(),
+        })
+        .collect()
+}
+
+/// Unified market browse: curated catalog (always) + every configured source.
+/// A source is discovered as a repo unless it ends in `.json` (legacy index).
+/// Network/rate-limit failures on a single source are collected as warnings
+/// rather than failing the whole market, so the curated catalog still shows.
+pub fn browse_market_v2(
+    sources: &[String],
+    token: Option<&str>,
+    include_curated: bool,
+    resources: &[SkillResource],
+) -> (Vec<MarketEntry>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut warnings = Vec::new();
+    if include_curated {
+        candidates.extend(curated_official_candidates());
+    }
+
+    for source in sources
+        .iter()
+        .map(|source| source.trim())
+        .filter(|source| !source.is_empty())
+    {
+        let result = if source.to_ascii_lowercase().ends_with(".json") {
+            fetch_github_index(source).map(|entries| {
+                entries
+                    .into_iter()
+                    .map(MarketCandidate::from_index_entry)
+                    .collect()
+            })
+        } else {
+            discover_repo_skill_candidates(source, token)
+        };
+        match result {
+            Ok(found) => candidates.extend(found),
+            Err(error) => warnings.push(format!("{source}: {error}")),
+        }
+    }
+
+    (assemble_market(candidates, resources), warnings)
+}
+
+/// Discover skills inside a public GitHub repo: one `git/trees?recursive=1`
+/// call locates every `SKILL.md`, frontmatter is read over un-rate-limited raw,
+/// and one repo-metadata call attaches the star count (leaderboard signal).
+fn discover_repo_skill_candidates(
+    source: &str,
+    token: Option<&str>,
+) -> HubResult<Vec<MarketCandidate>> {
+    validate_github_source(source)?;
+    let github_ref = parse_github_ref(source)?;
+    let client = market_discovery_http_client()?;
+
+    let branch = github_ref.branch.clone().unwrap_or_else(|| "main".to_string());
+
+    let stars = token
+        .filter(|token| !token.trim().is_empty())
+        .and_then(|token| repo_stars(&client, &github_ref, Some(token)));
+    let repo = format!("{}/{}", github_ref.owner, github_ref.repo);
+
+    let market_paths = match list_market_paths(&client, &github_ref, &branch, token) {
+        Ok(paths) => paths,
+        Err(api_error) => {
+            return discover_repo_skill_candidates_from_archive(source, &github_ref, &branch, stars)
+                .map_err(|archive_error| {
+                    SkillHubError::Io(format!(
+                        "GitHub API discovery failed ({api_error}); archive fallback failed ({archive_error})"
+                    ))
+                });
+        }
+    };
+    let plugin_dirs: Vec<String> = market_paths
+        .plugin_manifests
+        .iter()
+        .filter_map(|path| plugin_manifest_resource_dir(path))
+        .collect();
+    // If the URL pinned a subpath, only keep skills under it.
+    let scoped_skills: Vec<String> = match &github_ref.subpath {
+        Some(prefix) => market_paths
+            .skills
+            .into_iter()
+            .filter(|path| {
+                path.starts_with(&format!("{prefix}/")) || path == &format!("{prefix}/SKILL.md")
+            })
+            .collect(),
+        None => market_paths.skills,
+    }
+    .into_iter()
+    .filter(|path| !is_path_under_any_dir(path, &plugin_dirs))
+    .collect();
+    let scoped_plugins: Vec<String> = match &github_ref.subpath {
+        Some(prefix) => market_paths
+            .plugin_manifests
+            .into_iter()
+            .filter(|path| path.starts_with(&format!("{prefix}/")) || path == prefix)
+            .collect(),
+        None => market_paths.plugin_manifests,
+    };
+
+    let mut candidates = Vec::new();
+    // Cap raw frontmatter fetches to keep discovery responsive on large repos.
+    const MAX_DESC_FETCH: usize = 18;
+    for (index, skill_md) in scoped_skills.iter().enumerate() {
+        let subpath = skill_md
+            .trim_end_matches("/SKILL.md")
+            .trim_end_matches("SKILL.md");
+        let subpath = subpath.trim_end_matches('/');
+        let dir_name = subpath
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(&github_ref.repo)
+            .to_string();
+
+        let (name, summary) = if index < MAX_DESC_FETCH {
+            let raw_url = if subpath.is_empty() {
+                format!(
+                    "https://raw.githubusercontent.com/{}/{}/{}/SKILL.md",
+                    github_ref.owner, github_ref.repo, branch
+                )
+            } else {
+                format!(
+                    "https://raw.githubusercontent.com/{}/{}/{}/{}/SKILL.md",
+                    github_ref.owner, github_ref.repo, branch, subpath
+                )
+            };
+            match fetch_raw_text(&client, &raw_url) {
+                Ok(body) => {
+                    let meta = parse_skill_metadata(&body);
+                    (meta.name.unwrap_or_else(|| dir_name.clone()), meta.summary)
+                }
+                Err(_) => (dir_name.clone(), None),
+            }
+        } else {
+            (dir_name.clone(), None)
+        };
+
+        let source_url = if subpath.is_empty() {
+            format!(
+                "https://github.com/{}/{}",
+                github_ref.owner, github_ref.repo
+            )
+        } else {
+            format!(
+                "https://github.com/{}/{}/tree/{}/{}",
+                github_ref.owner, github_ref.repo, branch, subpath
+            )
+        };
+
+        candidates.push(MarketCandidate {
+            name,
+            kind: ResourceKind::Skill,
+            summary,
+            source_url,
+            skill_sha256: None,
+            repo: Some(repo.clone()),
+            stars,
+            origin: if repo == OFFICIAL_REPO {
+                "official".to_string()
+            } else {
+                "community".to_string()
+            },
+        });
+    }
+
+    for plugin_manifest in scoped_plugins {
+        let Some(subpath) = plugin_manifest_resource_dir(&plugin_manifest) else {
+            continue;
+        };
+        let dir_name = subpath
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(&github_ref.repo)
+            .to_string();
+        let raw_url = if plugin_manifest.is_empty() {
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/{}/plugin.json",
+                github_ref.owner, github_ref.repo, branch
+            )
+        } else {
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                github_ref.owner, github_ref.repo, branch, plugin_manifest
+            )
+        };
+        let (name, summary) = match fetch_raw_text(&client, &raw_url) {
+            Ok(body) => {
+                let meta = parse_plugin_manifest_metadata(&body);
+                (meta.name.unwrap_or_else(|| dir_name.clone()), meta.summary)
+            }
+            Err(_) => (dir_name.clone(), None),
+        };
+        let source_url = if subpath.is_empty() {
+            format!(
+                "https://github.com/{}/{}",
+                github_ref.owner, github_ref.repo
+            )
+        } else {
+            format!(
+                "https://github.com/{}/{}/tree/{}/{}",
+                github_ref.owner, github_ref.repo, branch, subpath
+            )
+        };
+
+        candidates.push(MarketCandidate {
+            name,
+            kind: ResourceKind::Plugin,
+            summary,
+            source_url,
+            skill_sha256: None,
+            repo: Some(repo.clone()),
+            stars,
+            origin: if repo == OFFICIAL_REPO {
+                "official".to_string()
+            } else {
+                "community".to_string()
+            },
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn discover_repo_skill_candidates_from_archive(
+    source: &str,
+    github_ref: &GitHubRef,
+    _fallback_branch: &str,
+    stars: Option<u64>,
+) -> HubResult<Vec<MarketCandidate>> {
+    let staging = staging_dir("market-discovery")?;
+    let result = (|| {
+        let (extracted_root, branch) = download_and_extract_repo(github_ref, &staging)?;
+        discover_repo_skill_candidates_from_dir(github_ref, &extracted_root, &branch, stars)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result.map_err(|error| {
+        SkillHubError::Io(format!(
+            "{}: {}",
+            normalize_github_url(source),
+            error
+        ))
+    })
+}
+
+fn discover_repo_skill_candidates_from_dir(
+    github_ref: &GitHubRef,
+    extracted_root: &Path,
+    branch: &str,
+    stars: Option<u64>,
+) -> HubResult<Vec<MarketCandidate>> {
+    let source_dir = resolve_source_dir(extracted_root, github_ref)?;
+    let mut plugin_manifest_files = Vec::new();
+    collect_plugin_manifest_files(&source_dir, &mut plugin_manifest_files)?;
+    plugin_manifest_files.sort();
+    let plugin_dirs: Vec<PathBuf> = plugin_manifest_files
+        .iter()
+        .filter_map(|path| plugin_manifest_resource_path(path))
+        .collect();
+
+    let mut skill_files = Vec::new();
+    collect_skill_md_files(&source_dir, &mut skill_files)?;
+    skill_files.retain(|path| {
+        !plugin_dirs.iter().any(|plugin_dir| {
+            path.parent()
+                .is_some_and(|parent| parent.starts_with(plugin_dir))
+        })
+    });
+    skill_files.sort();
+
+    let repo = format!("{}/{}", github_ref.owner, github_ref.repo);
+    let mut candidates = Vec::new();
+    for manifest_file in plugin_manifest_files {
+        let Some(plugin_dir) = plugin_manifest_resource_path(&manifest_file) else {
+            continue;
+        };
+        let relative_dir = plugin_dir
+            .strip_prefix(extracted_root)
+            .unwrap_or(&plugin_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source_relative = plugin_dir
+            .strip_prefix(&source_dir)
+            .unwrap_or(&plugin_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dir_name = source_relative
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(&github_ref.repo)
+            .to_string();
+        let meta = fs::read_to_string(&manifest_file)
+            .map(|body| parse_plugin_manifest_metadata(&body))
+            .unwrap_or_default();
+        let source_url = if relative_dir.is_empty() {
+            format!(
+                "https://github.com/{}/{}",
+                github_ref.owner, github_ref.repo
+            )
+        } else {
+            format!(
+                "https://github.com/{}/{}/tree/{}/{}",
+                github_ref.owner, github_ref.repo, branch, relative_dir
+            )
+        };
+
+        candidates.push(MarketCandidate {
+            name: meta.name.unwrap_or(dir_name),
+            kind: ResourceKind::Plugin,
+            summary: meta.summary,
+            source_url,
+            skill_sha256: None,
+            repo: Some(repo.clone()),
+            stars,
+            origin: if repo == OFFICIAL_REPO {
+                "official".to_string()
+            } else {
+                "community".to_string()
+            },
+        });
+    }
+
+    for skill_file in skill_files {
+        let skill_dir = skill_file.parent().unwrap_or(&source_dir);
+        let relative_dir = skill_dir
+            .strip_prefix(extracted_root)
+            .unwrap_or(skill_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source_relative = skill_dir
+            .strip_prefix(&source_dir)
+            .unwrap_or(skill_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dir_name = source_relative
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(&github_ref.repo)
+            .to_string();
+        let meta = fs::read_to_string(&skill_file)
+            .map(|body| parse_skill_metadata(&body))
+            .unwrap_or_default();
+        let source_url = if relative_dir.is_empty() {
+            format!(
+                "https://github.com/{}/{}",
+                github_ref.owner, github_ref.repo
+            )
+        } else {
+            format!(
+                "https://github.com/{}/{}/tree/{}/{}",
+                github_ref.owner, github_ref.repo, branch, relative_dir
+            )
+        };
+
+        candidates.push(MarketCandidate {
+            name: meta.name.unwrap_or(dir_name),
+            kind: ResourceKind::Skill,
+            summary: meta.summary,
+            source_url,
+            skill_sha256: None,
+            repo: Some(repo.clone()),
+            stars,
+            origin: if repo == OFFICIAL_REPO {
+                "official".to_string()
+            } else {
+                "community".to_string()
+            },
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn collect_skill_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> HubResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_md_files(&path, out)?;
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_plugin_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) -> HubResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_plugin_manifest_files(&path, out)?;
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("plugin.json")
+            && plugin_manifest_resource_path(&path).is_some()
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn plugin_manifest_resource_path(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("plugin.json") {
+        return None;
+    }
+    let parent = path.parent()?;
+    match parent.file_name().and_then(|name| name.to_str()) {
+        Some(".claude-plugin" | ".codex-plugin") => parent.parent().map(Path::to_path_buf),
+        _ => Some(parent.to_path_buf()),
+    }
+}
+
+fn github_api_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+) -> HubResult<reqwest::blocking::Response> {
+    let mut request = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
+        request = request.header("Authorization", format!("Bearer {}", token.trim()));
+    }
+    let response = request
+        .send()
+        .map_err(|error| SkillHubError::Io(error.to_string()))?;
+    if response.status().as_u16() == 403 || response.status().as_u16() == 429 {
+        return Err(SkillHubError::Io(
+            "GitHub API rate limit reached. Add a token in Settings or try later.".to_string(),
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(SkillHubError::Io(format!(
+            "GitHub API error: {}",
+            response.status()
+        )));
+    }
+    Ok(response)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MarketPaths {
+    skills: Vec<String>,
+    plugin_manifests: Vec<String>,
+}
+
+fn list_market_paths(
+    client: &reqwest::blocking::Client,
+    github_ref: &GitHubRef,
+    branch: &str,
+    token: Option<&str>,
+) -> HubResult<MarketPaths> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
+        github_ref.owner, github_ref.repo, branch
+    );
+    let response = github_api_get(client, &url, token)?;
+    let body = response
+        .text()
+        .map_err(|error| SkillHubError::Io(error.to_string()))?;
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|error| SkillHubError::InvalidResource(error.to_string()))?;
+    Ok(extract_market_paths(&value))
+}
+
+/// Pull every `*/SKILL.md` (or root `SKILL.md`) path out of a git trees reply.
+#[cfg(test)]
+fn extract_skill_md_paths(value: &serde_json::Value) -> Vec<String> {
+    extract_market_paths(value).skills
+}
+
+fn extract_market_paths(value: &serde_json::Value) -> MarketPaths {
+    let mut paths = Vec::new();
+    let mut plugin_manifests = Vec::new();
+    if let Some(tree) = value.get("tree").and_then(|tree| tree.as_array()) {
+        for node in tree {
+            let Some(path) = node.get("path").and_then(|path| path.as_str()) else {
+                continue;
+            };
+            if path == "SKILL.md" || path.ends_with("/SKILL.md") {
+                paths.push(path.to_string());
+            }
+            if plugin_manifest_resource_dir(path).is_some() {
+                plugin_manifests.push(path.to_string());
+            }
+        }
+    }
+    paths.sort();
+    plugin_manifests.sort();
+    MarketPaths {
+        skills: paths,
+        plugin_manifests,
+    }
+}
+
+fn plugin_manifest_resource_dir(path: &str) -> Option<String> {
+    if matches!(
+        path,
+        ".claude-plugin/plugin.json" | ".codex-plugin/plugin.json" | "plugin.json"
+    ) {
+        return Some(String::new());
+    }
+    for suffix in ["/.claude-plugin/plugin.json", "/.codex-plugin/plugin.json", "/plugin.json"] {
+        if let Some(dir) = path.strip_suffix(suffix) {
+            return Some(dir.to_string());
+        }
+    }
+    None
+}
+
+fn is_path_under_any_dir(path: &str, dirs: &[String]) -> bool {
+    dirs.iter().any(|dir| {
+        if dir.is_empty() {
+            return true;
+        }
+        path == dir || path.starts_with(&format!("{dir}/"))
+    })
+}
+
+fn repo_stars(
+    client: &reqwest::blocking::Client,
+    github_ref: &GitHubRef,
+    token: Option<&str>,
+) -> Option<u64> {
+    let value = repo_metadata(client, github_ref, token)?;
+    value
+        .get("stargazers_count")
+        .and_then(|stars| stars.as_u64())
+}
+
+fn repo_metadata(
+    client: &reqwest::blocking::Client,
+    github_ref: &GitHubRef,
+    token: Option<&str>,
+) -> Option<serde_json::Value> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}",
+        github_ref.owner, github_ref.repo
+    );
+    let response = github_api_get(client, &url, token).ok()?;
+    let body = response.text().ok()?;
+    serde_json::from_str::<serde_json::Value>(&body).ok()
+}
+
+fn fetch_raw_text(client: &reqwest::blocking::Client, url: &str) -> HubResult<String> {
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| SkillHubError::Io(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(SkillHubError::Io(format!(
+            "raw fetch failed: {}",
+            response.status()
+        )));
+    }
+    response
+        .text()
+        .map_err(|error| SkillHubError::Io(error.to_string()))
+}
+
+/// Parse a public GitHub URL into owner/repo plus an optional branch + subpath.
+/// Accepts `https://github.com/owner/repo`, `.../tree/<branch>/<sub/path>`,
+/// and `git@github.com:owner/repo` forms. Rejects non-GitHub URLs.
+fn parse_github_ref(source: &str) -> HubResult<GitHubRef> {
+    let normalized = normalize_github_url(source);
+    let remainder = normalized
+        .strip_prefix("https://github.com/")
+        .or_else(|| normalized.strip_prefix("git@github.com:"))
+        .ok_or_else(|| {
+            SkillHubError::UnsupportedSource("only public GitHub URLs are supported".to_string())
+        })?;
+    let parts: Vec<&str> = remainder
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return Err(SkillHubError::UnsupportedSource(
+            "GitHub source must include owner and repository".to_string(),
+        ));
+    }
+    let owner = parts[0].to_string();
+    let repo = parts[1].trim_end_matches(".git").to_string();
+
+    let (branch, subpath) = if parts.len() > 2 && (parts[2] == "tree" || parts[2] == "blob") {
+        let branch = parts.get(3).map(|value| value.to_string());
+        let sub = parts
+            .get(4..)
+            .map(|rest| rest.join("/"))
+            .filter(|s| !s.is_empty());
+        (branch, sub)
+    } else {
+        (None, None)
+    };
+
+    Ok(GitHubRef {
+        owner,
+        repo,
+        branch,
+        subpath,
+    })
+}
+
+/// raw.githubusercontent.com URL for the skill's SKILL.md given a parsed ref.
+fn raw_skill_md_url(github_ref: &GitHubRef, branch: &str) -> String {
+    let mut url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        github_ref.owner, github_ref.repo, branch
+    );
+    if let Some(subpath) = &github_ref.subpath {
+        url.push('/');
+        url.push_str(subpath);
+    }
+    url.push_str("/SKILL.md");
+    url
+}
+
+fn candidate_branches(github_ref: &GitHubRef) -> Vec<String> {
+    match &github_ref.branch {
+        Some(branch) => vec![branch.clone()],
+        None => vec!["main".to_string(), "master".to_string()],
+    }
+}
+
+fn http_client() -> HubResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("SkillHub/0.1")
+        .build()
+        .map_err(|error| SkillHubError::Io(error.to_string()))
+}
+
+fn market_discovery_http_client() -> HubResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(MARKET_DISCOVERY_HTTP_TIMEOUT_SECS))
+        .user_agent("SkillHub/0.1")
+        .build()
+        .map_err(|error| SkillHubError::Io(error.to_string()))
+}
+
+/// Download a GitHub repo tarball over HTTPS and extract it into `dest`.
+/// Returns the directory the archive expanded into (codeload prefixes a
+/// `<repo>-<branch>` folder). Trying configured branch, else main then master.
+fn download_and_extract_repo(github_ref: &GitHubRef, dest: &Path) -> HubResult<(PathBuf, String)> {
+    let client = http_client()?;
+    let mut last_error = SkillHubError::Io("no branch could be downloaded".to_string());
+    for branch in candidate_branches(github_ref) {
+        let url = format!(
+            "https://codeload.github.com/{}/{}/tar.gz/refs/heads/{}",
+            github_ref.owner, github_ref.repo, branch
+        );
+        let response = match client.get(&url).send() {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = SkillHubError::Io(error.to_string());
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = SkillHubError::Io(format!(
+                "failed to download {}/{} ({branch}): {}",
+                github_ref.owner,
+                github_ref.repo,
+                response.status()
+            ));
+            continue;
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|error| SkillHubError::Io(error.to_string()))?;
+        let branch_dest = dest.join(&branch);
+        fs::create_dir_all(&branch_dest)?;
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .unpack(&branch_dest)
+            .map_err(|error| SkillHubError::Io(error.to_string()))?;
+        let extracted_root = first_subdirectory(&branch_dest)?;
+        return Ok((extracted_root, branch));
+    }
+    Err(last_error)
+}
+
+fn first_subdirectory(dir: &Path) -> HubResult<PathBuf> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            return Ok(entry.path());
+        }
+    }
+    Err(SkillHubError::InvalidResource(
+        "downloaded archive contained no directory".to_string(),
+    ))
+}
+
+/// Resolve the source directory inside an extracted repo: the subpath if the
+/// URL pinned one, otherwise the repo root.
+fn resolve_source_dir(extracted_root: &Path, github_ref: &GitHubRef) -> HubResult<PathBuf> {
+    let candidate = match &github_ref.subpath {
+        Some(subpath) => extracted_root.join(subpath),
+        None => extracted_root.to_path_buf(),
+    };
+    let canonical = canonical_existing(&candidate)?;
+    // Containment guard: the resolved path must stay inside the extracted repo.
+    assert_inside(&canonical, &canonical_existing(extracted_root)?)?;
+    Ok(canonical)
+}
+
+pub fn install_github_resource(
+    source: &str,
+    host_root: &HostRoot,
+    kind: ResourceKind,
+    name: &str,
+) -> HubResult<()> {
+    validate_github_source(source)?;
+    let github_ref = parse_github_ref(source)?;
+    // Fail fast on name/conflict/containment before doing any network IO.
+    let preview = preview_install_common(source.to_string(), None, host_root, kind, name)?;
+
+    let staging = staging_dir(name)?;
+    let result = (|| {
+        let (extracted_root, _branch) = download_and_extract_repo(&github_ref, &staging)?;
+        let source_dir = resolve_source_dir(&extracted_root, &github_ref)?;
+        validate_resource_shape(&source_dir, kind)?;
+        if preview.target_path.exists() {
+            return Err(SkillHubError::NameConflict(format!(
+                "{} already exists",
+                preview.target_path.display()
+            )));
+        }
+        copy_dir_filtered(&source_dir, &preview.target_path)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+pub fn check_github_update(source: &str, local_path: &Path) -> HubResult<UpdateCheck> {
+    validate_github_source(source)?;
+    let github_ref = parse_github_ref(source)?;
+    let local_sha = file_sha256(&local_path.join("SKILL.md")).ok();
+
+    let client = http_client()?;
+    let mut remote_sha = None;
+    let mut detail = None;
+    for branch in candidate_branches(&github_ref) {
+        let url = raw_skill_md_url(&github_ref, &branch);
+        match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => {
+                if let Ok(body) = response.bytes() {
+                    remote_sha = Some(sha256_bytes(&body));
+                    break;
+                }
+            }
+            Ok(response) => {
+                detail = Some(format!("{}", response.status()));
+            }
+            Err(error) => {
+                detail = Some(error.to_string());
+            }
+        }
+    }
+
+    let status = compare_update_status(local_sha.as_deref(), remote_sha.as_deref());
+    Ok(UpdateCheck {
+        status: status.to_string(),
+        source_url: normalize_github_url(source),
+        local_sha256: local_sha,
+        remote_sha256: remote_sha,
+        detail,
+    })
+}
+
+/// Pure comparison of local vs remote SKILL.md hashes.
+fn compare_update_status(local: Option<&str>, remote: Option<&str>) -> &'static str {
+    match (local, remote) {
+        (Some(local), Some(remote)) if local.eq_ignore_ascii_case(remote) => "up-to-date",
+        (Some(_), Some(_)) => "update-available",
+        _ => "unknown",
+    }
+}
+
+pub fn update_github_resource(
+    source: &str,
+    host_root: &HostRoot,
+    kind: ResourceKind,
+    name: &str,
+    existing_path: &Path,
+    trash: &mut dyn Trash,
+) -> HubResult<()> {
+    validate_github_source(source)?;
+    let github_ref = parse_github_ref(source)?;
+    let root = canonical_or_create(&host_root.root)?;
+    let existing = canonical_existing(existing_path)?;
+    assert_inside(&existing, &root)?;
+
+    // Download + validate into staging BEFORE touching the installed copy, so a
+    // network or validation failure leaves the existing skill untouched.
+    let staging = staging_dir(name)?;
+    let staged_source = (|| {
+        let (extracted_root, _branch) = download_and_extract_repo(&github_ref, &staging)?;
+        let source_dir = resolve_source_dir(&extracted_root, &github_ref)?;
+        validate_resource_shape(&source_dir, kind)?;
+        Ok::<PathBuf, SkillHubError>(source_dir)
+    })();
+
+    let result = (|| {
+        let source_dir = staged_source?;
+        let target_path = target_path_for(&root, kind, name);
+        assert_inside_nonexistent(&target_path, &root)?;
+        // Move the existing copy to trash, then install fresh. No permanent delete.
+        trash.trash(&existing)?;
+        copy_dir_filtered(&source_dir, &target_path)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn staging_dir(name: &str) -> HubResult<PathBuf> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let safe_name: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let dir = std::env::temp_dir().join(format!("skill-hub-dl-{safe_name}-{nonce}"));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn fetch_github_index(url: &str) -> HubResult<Vec<GitHubIndexEntry>> {
     if !url.starts_with("https://") {
         return Err(SkillHubError::UnsupportedSource(
             "GitHub index URL must use https://".to_string(),
         ));
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent("SkillHub/0.1")
-        .build()
-        .map_err(|error| SkillHubError::Io(error.to_string()))?;
+    let client = market_discovery_http_client()?;
     let response = client
         .get(url)
         .send()
@@ -690,6 +1912,14 @@ fn parse_github_index_value(value: &serde_json::Value) -> Vec<GitHubIndexEntry> 
 
 fn parse_github_index_entry(value: &serde_json::Value) -> Option<GitHubIndexEntry> {
     let name = string_field(value, &["name", "skill", "id"])?;
+    let kind = match string_field(value, &["kind", "type", "resourceKind"])
+        .unwrap_or("skill")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "plugin" => ResourceKind::Plugin,
+        _ => ResourceKind::Skill,
+    };
     let source_url = string_field(
         value,
         &[
@@ -712,6 +1942,7 @@ fn parse_github_index_entry(value: &serde_json::Value) -> Option<GitHubIndexEntr
 
     Some(GitHubIndexEntry {
         name: name.to_string(),
+        kind,
         summary: summary.map(str::to_string),
         source_url,
         skill_sha256,
@@ -732,8 +1963,7 @@ fn normalize_text(value: &str) -> String {
 
 fn file_sha256(path: &Path) -> HubResult<String> {
     let bytes = fs::read(path)?;
-    let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(sha256_bytes(&bytes))
 }
 
 fn compatibility_for(host: HostKind, kind: ResourceKind) -> Vec<String> {
@@ -881,7 +2111,9 @@ fn validate_resource_shape(path: &Path, kind: ResourceKind) -> HubResult<()> {
     let valid = match kind {
         ResourceKind::Skill => path.join("SKILL.md").is_file(),
         ResourceKind::Plugin => {
-            path.join("plugin.json").is_file() || path.join(".codex-plugin/plugin.json").is_file()
+            path.join("plugin.json").is_file()
+                || path.join(".codex-plugin/plugin.json").is_file()
+                || path.join(".claude-plugin/plugin.json").is_file()
         }
         ResourceKind::Unknown => false,
     };
@@ -1032,9 +2264,19 @@ fn is_sensitive_path(path: &Path) -> bool {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             scan_inventory,
             match_github_sources,
+            browse_market,
+            discover_market,
+            discover_market_source,
+            discover_curated_catalog,
+            discover_repo,
+            install_github_skill,
+            check_skill_update,
+            update_github_skill,
             preview_source,
             install_resource,
             delete_resource
@@ -1279,6 +2521,35 @@ mod tests {
     }
 
     #[test]
+    fn bundled_runtime_plugins_stay_native_even_when_manifest_has_repository() {
+        let root = temp_root("runtime-plugin-source");
+        write_file(
+            &root.join("plugins/cache/openai-primary-runtime/presentations/26.619.11828/.codex-plugin/plugin.json"),
+            r#"{
+              "name": "presentations",
+              "repository": "https://github.com/openai/openai/tree/main/lib/presentations/plugin",
+              "interface": {
+                "displayName": "Presentations",
+                "shortDescription": "Create or edit PowerPoint decks"
+              }
+            }"#,
+        );
+
+        let resources = scan_host(&HostRoot::new(HostKind::Codex, root)).expect("scan");
+        let plugin = resources
+            .iter()
+            .find(|resource| resource.name == "Presentations")
+            .expect("plugin");
+
+        assert_eq!(plugin.source_kind, SourceKind::Native);
+        assert_eq!(plugin.update_status, "Managed");
+        assert_eq!(
+            plugin.source_url.as_deref(),
+            Some("https://github.com/openai/openai/tree/main/lib/presentations/plugin")
+        );
+    }
+
+    #[test]
     fn install_preview_accepts_github_sources_and_rejects_local_urls_and_conflicts() {
         let root = temp_root("preview");
         write_file(&root.join("skills/existing/SKILL.md"), "# Existing");
@@ -1345,5 +2616,357 @@ mod tests {
 
         assert_eq!(trash.paths, vec![canonical_resource]);
         assert!(trash.permanent_delete_attempted.is_none());
+    }
+
+    #[test]
+    fn parses_github_ref_with_and_without_tree_subpath() {
+        let plain = parse_github_ref("https://github.com/acme/tools").expect("plain");
+        assert_eq!(plain.owner, "acme");
+        assert_eq!(plain.repo, "tools");
+        assert_eq!(plain.branch, None);
+        assert_eq!(plain.subpath, None);
+
+        let nested = parse_github_ref("https://github.com/openai/openai/tree/main/skills/browser")
+            .expect("nested");
+        assert_eq!(nested.owner, "openai");
+        assert_eq!(nested.repo, "openai");
+        assert_eq!(nested.branch.as_deref(), Some("main"));
+        assert_eq!(nested.subpath.as_deref(), Some("skills/browser"));
+
+        let ssh = parse_github_ref("git@github.com:acme/tools.git").expect("ssh");
+        assert_eq!(ssh.owner, "acme");
+        assert_eq!(ssh.repo, "tools");
+
+        assert!(matches!(
+            parse_github_ref("https://gitlab.com/acme/tools"),
+            Err(SkillHubError::UnsupportedSource(_))
+        ));
+    }
+
+    #[test]
+    fn archive_market_discovery_scans_local_skill_files() {
+        let extracted = temp_root("archive-market");
+        write_file(
+            &extracted.join("skills/alpha/SKILL.md"),
+            "---\ndescription: Alpha summary\n---\n# Alpha",
+        );
+        write_file(
+            &extracted.join("skills/nested/beta/SKILL.md"),
+            "# Beta\nBeta summary",
+        );
+        write_file(&extracted.join("README.md"), "not a skill");
+
+        let github_ref = parse_github_ref("https://github.com/acme/tools").expect("github ref");
+        let candidates =
+            discover_repo_skill_candidates_from_dir(&github_ref, &extracted, "main", Some(42))
+                .expect("archive candidates");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].name, "alpha");
+        assert_eq!(candidates[0].summary.as_deref(), Some("Alpha summary"));
+        assert_eq!(
+            candidates[0].source_url,
+            "https://github.com/acme/tools/tree/main/skills/alpha"
+        );
+        assert_eq!(candidates[0].stars, Some(42));
+        assert_eq!(candidates[1].name, "beta");
+        assert_eq!(
+            candidates[1].source_url,
+            "https://github.com/acme/tools/tree/main/skills/nested/beta"
+        );
+    }
+
+    #[test]
+    fn derives_raw_skill_md_url_for_branch_and_subpath() {
+        let nested = parse_github_ref("https://github.com/openai/openai/tree/main/skills/browser")
+            .expect("nested");
+        assert_eq!(
+            raw_skill_md_url(&nested, "main"),
+            "https://raw.githubusercontent.com/openai/openai/main/skills/browser/SKILL.md"
+        );
+
+        let plain = parse_github_ref("https://github.com/acme/tools").expect("plain");
+        assert_eq!(
+            raw_skill_md_url(&plain, "master"),
+            "https://raw.githubusercontent.com/acme/tools/master/SKILL.md"
+        );
+        assert_eq!(candidate_branches(&plain), vec!["main", "master"]);
+        assert_eq!(candidate_branches(&nested), vec!["main"]);
+    }
+
+    #[test]
+    fn compares_update_status_from_local_and_remote_hashes() {
+        assert_eq!(
+            compare_update_status(Some("ABC"), Some("abc")),
+            "up-to-date"
+        );
+        assert_eq!(
+            compare_update_status(Some("abc"), Some("def")),
+            "update-available"
+        );
+        assert_eq!(compare_update_status(None, Some("abc")), "unknown");
+        assert_eq!(compare_update_status(Some("abc"), None), "unknown");
+    }
+
+    #[test]
+    fn market_entries_dedupe_and_flag_installed_resources() {
+        let root = temp_root("market-mark");
+        write_file(
+            &root.join("skills/ppt-master/SKILL.md"),
+            "---\nname: ppt-master\ndescription: Make presentations\n---\n",
+        );
+        let resources = scan_host(&HostRoot::new(HostKind::Codex, root)).expect("scan");
+        let candidates = vec![
+            MarketCandidate::from_index_entry(GitHubIndexEntry {
+                name: "ppt-master".to_string(),
+                kind: ResourceKind::Skill,
+                summary: Some("Make presentations".to_string()),
+                source_url: "https://github.com/acme/ppt-master".to_string(),
+                skill_sha256: None,
+            }),
+            // Duplicate source_url should be deduped.
+            MarketCandidate::from_index_entry(GitHubIndexEntry {
+                name: "ppt-master".to_string(),
+                kind: ResourceKind::Skill,
+                summary: None,
+                source_url: "https://github.com/acme/ppt-master".to_string(),
+                skill_sha256: None,
+            }),
+            MarketCandidate::from_index_entry(GitHubIndexEntry {
+                name: "not-installed".to_string(),
+                kind: ResourceKind::Skill,
+                summary: Some("Another tool".to_string()),
+                source_url: "https://github.com/acme/other".to_string(),
+                skill_sha256: None,
+            }),
+        ];
+
+        let market = assemble_market(candidates, &resources);
+
+        assert_eq!(market.len(), 2);
+        let ppt = market
+            .iter()
+            .find(|entry| entry.name == "ppt-master")
+            .expect("ppt market entry");
+        assert!(ppt.installed);
+        assert!(ppt.installed_id.is_some());
+        assert_eq!(ppt.repo.as_deref(), Some("acme/ppt-master"));
+        let other = market
+            .iter()
+            .find(|entry| entry.name == "not-installed")
+            .expect("other market entry");
+        assert!(!other.installed);
+        assert!(other.installed_id.is_none());
+    }
+
+    #[test]
+    fn extracts_skill_md_paths_from_trees_response() {
+        let trees = serde_json::json!({
+            "tree": [
+                { "path": "README.md", "type": "blob" },
+                { "path": "skills", "type": "tree" },
+                { "path": "skills/pdf/SKILL.md", "type": "blob" },
+                { "path": "skills/pdf/scripts/run.py", "type": "blob" },
+                { "path": "skills/docx/SKILL.md", "type": "blob" },
+                { "path": "plugins/github/.claude-plugin/plugin.json", "type": "blob" },
+                { "path": "plugins/github/skills/internal/SKILL.md", "type": "blob" },
+                { "path": "SKILL.md", "type": "blob" }
+            ]
+        });
+        let paths = extract_skill_md_paths(&trees);
+        assert_eq!(
+            paths,
+            vec![
+                "SKILL.md".to_string(),
+                "plugins/github/skills/internal/SKILL.md".to_string(),
+                "skills/docx/SKILL.md".to_string(),
+                "skills/pdf/SKILL.md".to_string(),
+            ]
+        );
+        let market_paths = extract_market_paths(&trees);
+        assert_eq!(
+            market_paths.plugin_manifests,
+            vec!["plugins/github/.claude-plugin/plugin.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn curated_official_catalog_is_complete_and_well_formed() {
+        let candidates = curated_official_candidates();
+        assert_eq!(candidates.len(), 17);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.origin == "official"
+                && candidate.summary.is_some()
+                && candidate
+                    .source_url
+                    .starts_with("https://github.com/anthropics/skills/tree/main/skills/")
+                && candidate.repo.as_deref() == Some("anthropics/skills")
+        }));
+        let pdf = candidates
+            .iter()
+            .find(|candidate| candidate.name == "pdf")
+            .expect("pdf in catalog");
+        assert_eq!(
+            pdf.source_url,
+            "https://github.com/anthropics/skills/tree/main/skills/pdf"
+        );
+    }
+
+    #[test]
+    fn market_sorts_by_stars_then_name_as_leaderboard() {
+        let candidates = vec![
+            MarketCandidate {
+                name: "zeta".to_string(),
+                kind: ResourceKind::Skill,
+                summary: None,
+                source_url: "https://github.com/a/zeta".to_string(),
+                skill_sha256: None,
+                repo: Some("a/zeta".to_string()),
+                stars: Some(10),
+                origin: "community".to_string(),
+            },
+            MarketCandidate {
+                name: "alpha".to_string(),
+                kind: ResourceKind::Skill,
+                summary: None,
+                source_url: "https://github.com/a/alpha".to_string(),
+                skill_sha256: None,
+                repo: Some("a/alpha".to_string()),
+                stars: Some(500),
+                origin: "community".to_string(),
+            },
+            MarketCandidate {
+                name: "beta".to_string(),
+                kind: ResourceKind::Skill,
+                summary: None,
+                source_url: "https://github.com/a/beta".to_string(),
+                skill_sha256: None,
+                repo: Some("a/beta".to_string()),
+                stars: None,
+                origin: "community".to_string(),
+            },
+        ];
+        let market = assemble_market(candidates, &[]);
+        let order: Vec<&str> = market.iter().map(|entry| entry.name.as_str()).collect();
+        // Highest stars first; the star-less entry sorts last.
+        assert_eq!(order, vec!["alpha", "zeta", "beta"]);
+    }
+
+    #[test]
+    fn browse_market_v2_includes_curated_catalog_offline() {
+        // No sources, curated on: must return the 17 official skills with no
+        // network access at all.
+        let (entries, warnings) = browse_market_v2(&[], None, true, &[]);
+        assert_eq!(entries.len(), 17);
+        assert!(warnings.is_empty());
+        assert!(entries.iter().all(|entry| entry.origin == "official"));
+        assert!(entries.iter().any(|entry| entry.name == "pdf"));
+    }
+
+    #[test]
+    fn archive_market_discovery_separates_plugins_from_skills() {
+        let extracted = temp_root("market-plugin-discovery");
+        write_file(
+            &extracted.join("plugins/github/.claude-plugin/plugin.json"),
+            r#"{"name":"github-plugin","description":"GitHub integration"}"#,
+        );
+        write_file(
+            &extracted.join("plugins/github/skills/internal/SKILL.md"),
+            "---\nname: internal-plugin-skill\ndescription: Should stay inside plugin\n---\n",
+        );
+        write_file(
+            &extracted.join("skills/pdf/SKILL.md"),
+            "---\nname: pdf\ndescription: PDF skill\n---\n",
+        );
+        let github_ref = GitHubRef {
+            owner: "acme".to_string(),
+            repo: "catalog".to_string(),
+            branch: None,
+            subpath: None,
+        };
+
+        let candidates =
+            discover_repo_skill_candidates_from_dir(&github_ref, &extracted, "main", Some(42))
+                .expect("discover from dir");
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.name == "github-plugin" && candidate.kind == ResourceKind::Plugin
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.name == "pdf" && candidate.kind == ResourceKind::Skill
+        }));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.name == "internal-plugin-skill"));
+    }
+
+    #[test]
+    fn resolve_source_dir_honors_subpath_and_stays_inside_repo() {
+        let extracted = temp_root("extract-root");
+        write_file(&extracted.join("skills/browser/SKILL.md"), "# Browser");
+
+        let nested = parse_github_ref("https://github.com/openai/openai/tree/main/skills/browser")
+            .expect("nested");
+        let resolved = resolve_source_dir(&extracted, &nested).expect("resolve");
+        assert!(resolved.ends_with("skills/browser"));
+        assert!(resolved.join("SKILL.md").is_file());
+
+        let plain = parse_github_ref("https://github.com/openai/openai").expect("plain");
+        let root_resolved = resolve_source_dir(&extracted, &plain).expect("resolve root");
+        assert_eq!(
+            root_resolved,
+            extracted.canonicalize().expect("canonical extract")
+        );
+    }
+
+    #[test]
+    fn install_github_skill_copies_extracted_tarball_into_root() {
+        // Build a real .tar.gz fixture and extract it, exercising the offline
+        // half of the install path (download is the only networked step).
+        let repo = temp_root("tar-src").join("ppt-master-main");
+        write_file(&repo.join("SKILL.md"), "# PPT Master\nMake decks.");
+        write_file(&repo.join("README.md"), "readme");
+        write_file(&repo.join(".env"), "TOKEN=secret");
+
+        let staging = temp_root("tar-staging");
+        let tar_path = staging.join("repo.tar.gz");
+        {
+            let tar_gz = fs::File::create(&tar_path).expect("create tar");
+            let encoder = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            builder
+                .append_dir_all("ppt-master-main", &repo)
+                .expect("append");
+            builder
+                .into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("gz finish");
+        }
+
+        let extract_into = staging.join("extracted");
+        fs::create_dir_all(&extract_into).expect("extract dir");
+        let bytes = fs::read(&tar_path).expect("read tar");
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        tar::Archive::new(decoder)
+            .unpack(&extract_into)
+            .expect("unpack");
+        let extracted_root = first_subdirectory(&extract_into).expect("subdir");
+
+        // Now install via the existing filtered copy + guards.
+        let root = temp_root("tar-install");
+        let preview = preview_local_install_for_tests(
+            &extracted_root,
+            &HostRoot::new(HostKind::Codex, root.clone()),
+            ResourceKind::Skill,
+            "ppt-master",
+        )
+        .expect("preview");
+        install_from_preview(&preview).expect("install");
+
+        assert!(root.join("skills/ppt-master/SKILL.md").is_file());
+        assert!(root.join("skills/ppt-master/README.md").is_file());
+        // Sensitive files must never be copied in.
+        assert!(!root.join("skills/ppt-master/.env").exists());
     }
 }

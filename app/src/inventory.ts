@@ -13,29 +13,23 @@ export function filterInventory(
     if (filters.host !== "all" && resource.host !== filters.host) {
       return false;
     }
-    if (filters.source !== "all" && resource.sourceKind !== filters.source) {
+    if (filters.source !== "all" && !matchesSourceGroup(resource.sourceKind, filters.source)) {
       return false;
     }
     if (!query) {
       return true;
     }
 
-    const searchable = [
-      resource.name,
-      resource.kind,
-      resource.host,
-      resource.status,
-      resource.path,
-      resource.summary,
-      resource.sourceKind,
-      resource.sourceUrl ?? "",
-      resource.updateStatus,
-      ...resource.compatibility,
-      ...resource.warnings,
-    ]
-      .join(" ")
-      .toLocaleLowerCase();
-
-    return searchable.includes(query);
+    return resource.name.toLocaleLowerCase().includes(query);
   });
+}
+
+function matchesSourceGroup(sourceKind: SkillResource["sourceKind"], selectedSource: SkillResource["sourceKind"]) {
+  if (selectedSource === "native") {
+    return sourceKind === "native" || sourceKind === "registry";
+  }
+  if (selectedSource === "local") {
+    return sourceKind === "local" || sourceKind === "linked";
+  }
+  return sourceKind === selectedSource;
 }
