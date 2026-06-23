@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { MarketEntry, MarketResult, SkillResource, UpdateCheck } from "./types";
@@ -129,6 +129,37 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "添加路径" }));
 
     expect(screen.getByText("~/custom/skills")).toBeInTheDocument();
+  });
+
+  it("follows system color-scheme changes when theme is system", () => {
+    let matches = true;
+    const listeners = new Set<(event: MediaQueryListEvent) => void>();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn(() => ({
+        get matches() {
+          return matches;
+        },
+        media: "(prefers-color-scheme: dark)",
+        addEventListener: (_event: "change", listener: (event: MediaQueryListEvent) => void) => {
+          listeners.add(listener);
+        },
+        removeEventListener: (_event: "change", listener: (event: MediaQueryListEvent) => void) => {
+          listeners.delete(listener);
+        },
+      })),
+    });
+
+    render(<App initialResources={inventory} />);
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+
+    act(() => {
+      matches = false;
+      listeners.forEach((listener) => listener({ matches } as MediaQueryListEvent));
+    });
+
+    expect(document.documentElement.dataset.theme).toBe("light");
   });
 
   it("only highlights the active sidebar navigation item", () => {
