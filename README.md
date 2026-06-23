@@ -4,7 +4,7 @@
 
 ![Skill Hub 桌面应用预览](docs/images/skill-hub-preview.png)
 
-Skill Hub 是一款用于管理本地 Codex 与 Claude skills 和 plugins 的 macOS 桌面应用。它会扫描本地资源目录，判断每个资源的来源，帮你区分官方、GitHub 和本地 skill。
+Skill Hub 是一款用于管理本地 Codex 与 Claude skills 和 plugins 的跨平台桌面应用，支持 macOS、Windows 和 Linux。它会扫描本地资源目录，判断每个资源的来源，帮你区分官方、GitHub 和本地 skill。
 
 ## 功能
 
@@ -25,16 +25,21 @@ Skill Hub 是一款用于管理本地 Codex 与 Claude skills 和 plugins 的 ma
 - 手动添加额外的 skill 扫描路径。
 - 中英文界面语言设置。
 - 深色与浅色主题。
-- 本地安装流程：直接替换 `/Applications/Skill-Hub.app`，无需每次都通过 DMG 重新安装。
+- macOS 本地安装流程：直接替换 `/Applications/Skill-Hub.app`，无需每次都通过 DMG 重新安装。
 
 ## 扫描机制
 
-Skill Hub 默认扫描以下根目录：
+Skill Hub 默认扫描当前系统常见的 Codex/Claude 根目录；不同设备上的安装路径可以不一样，应用会按平台扫描多个候选目录，并且始终优先使用环境变量 `CODEX_HOME` 与 `CLAUDE_HOME`。
+
+默认候选目录包括：
 
 - `~/.codex/skills`
 - `~/.codex/plugins`
 - `~/.claude/skills`
 - `~/.claude/plugins`
+- macOS：`~/Library/Application Support/Codex`、`~/Library/Application Support/Claude`
+- Windows：`%APPDATA%\Codex`、`%LOCALAPPDATA%\Codex`、`%APPDATA%\Claude`、`%LOCALAPPDATA%\Claude`
+- Linux：`${XDG_CONFIG_HOME:-~/.config}/codex`、`${XDG_CONFIG_HOME:-~/.config}/claude`
 
 你可以在设置里添加额外的 skill 根目录。包含 `SKILL.md` 的目录会被视为 skill；Codex 插件通过 `.codex-plugin/plugin.json` 识别，Claude 插件通过 `plugin.json` 识别。
 
@@ -145,7 +150,7 @@ cd app
 npm run release:latest-json
 ```
 
-脚本会根据当前 `tauri.conf.json` 版本和 updater 签名生成 `src-tauri/target/release/bundle/macos/latest.json`，可随 `Skill-Hub.app.tar.gz` 与 `.sig` 一起上传到 GitHub Release。
+脚本会根据当前 `tauri.conf.json` 版本和 updater 签名生成 `latest.json`。在单机本地构建时，它会读取当前平台的 updater 产物；在 GitHub Actions 发布流程中，它会合并 Windows、Linux 和 macOS 产物，生成包含多个 `platforms` 条目的统一 `latest.json`。
 
 ## 开发
 
@@ -153,7 +158,7 @@ npm run release:latest-json
 
 - Node.js
 - Rust
-- 打包 Tauri 应用需要 macOS
+- Windows 打包需要 Windows runner，Linux 打包需要 Linux runner，macOS 打包需要 macOS runner。仓库内置的 GitHub Actions release workflow 会分别在对应系统上构建。
 
 安装依赖：
 
@@ -185,7 +190,7 @@ cd src-tauri && cargo test
 npm run build:app
 ```
 
-把最新的本地构建安装到 `/Applications`：
+在 macOS 上把最新的本地构建安装到 `/Applications`：
 
 ```bash
 npm run install:local
@@ -199,6 +204,29 @@ npm run install:local
 
 ```bash
 npm run build:desktop
+```
+
+本地构建脚本是跨平台的，会从 `TAURI_SIGNING_PRIVATE_KEY` 读取 updater 签名私钥；如果未设置，则尝试读取 `TAURI_SIGNING_PRIVATE_KEY_PATH`，默认是 `~/.skill-hub/updater.key`。
+
+## 发布到 GitHub Release
+
+仓库包含 `.github/workflows/release.yml`。推送版本 tag（例如 `v0.4.0`）或手动触发 workflow 后，CI 会：
+
+1. 在 Ubuntu、Windows 和 macOS runner 上分别执行 Tauri 构建。
+2. 上传各平台安装包、updater 包和 `.sig` 签名文件。
+3. 合并所有 `.sig` 文件生成统一的 `latest.json`。
+4. 发布到同一个 GitHub Release。
+
+需要在仓库 Secrets 中配置：
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（如果私钥设置了密码）
+
+手动创建 release：
+
+```bash
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## 仓库结构

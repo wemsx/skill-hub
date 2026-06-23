@@ -594,7 +594,7 @@ function App({
         await invoke("install_github_skill", {
           source: entry.sourceUrl,
           host: marketHost,
-          root: marketHost === "codex" ? "~/.codex" : "~/.claude",
+          root: null,
           kind: entry.kind,
           name: entry.name,
         });
@@ -1860,7 +1860,8 @@ function installedResourceSource(resource: SkillResource) {
   if (resource.sourceKind === "native") return "Official";
   if (resource.sourceKind === "local") return "Local";
   if (resource.sourceKind === "linked") return "Linked";
-  if (resource.path.includes("/")) return resource.path.split("/").slice(-2).join("/");
+  const parts = pathParts(resource.path);
+  if (parts.length > 1) return parts.slice(-2).join("/");
   return resource.sourceKind;
 }
 
@@ -1882,8 +1883,7 @@ function updateNoticeFor(status: string, text: Labels) {
 }
 
 function compactPath(path: string) {
-  const home = "/Users/jerry";
-  const compact = path.startsWith(home) ? path.replace(home, "~") : path;
+  const compact = compactHomePath(path);
   if (compact.length <= 64) {
     return compact;
   }
@@ -1891,8 +1891,33 @@ function compactPath(path: string) {
 }
 
 function rootFromResourcePath(path: string) {
-  const marker = path.includes("/skills/") ? "/skills/" : "/plugins/";
-  return path.includes(marker) ? path.slice(0, path.indexOf(marker)) : path;
+  const normalized = normalizePathSeparators(path);
+  const skillsIndex = normalized.toLocaleLowerCase().indexOf("/skills/");
+  const pluginsIndex = normalized.toLocaleLowerCase().indexOf("/plugins/");
+  const markerIndex = skillsIndex >= 0 ? skillsIndex : pluginsIndex;
+  if (markerIndex < 0) return path;
+  return path.slice(0, markerIndex);
+}
+
+function pathParts(path: string) {
+  return normalizePathSeparators(path).split("/").filter(Boolean);
+}
+
+function normalizePathSeparators(path: string) {
+  return path.replace(/\\/g, "/");
+}
+
+function compactHomePath(path: string) {
+  const normalized = normalizePathSeparators(path);
+  const userHomeMatch = normalized.match(/^([A-Za-z]:)?\/Users\/[^/]+(?=\/|$)/);
+  if (userHomeMatch?.[0]) {
+    return path.replace(path.slice(0, userHomeMatch[0].length), "~");
+  }
+  const unixHomeMatch = normalized.match(/^\/home\/[^/]+(?=\/|$)/);
+  if (unixHomeMatch?.[0]) {
+    return path.replace(path.slice(0, unixHomeMatch[0].length), "~");
+  }
+  return path;
 }
 
 function loadSettings(): AppSettings {

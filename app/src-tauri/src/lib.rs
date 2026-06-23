@@ -314,13 +314,18 @@ async fn discover_repo(
 fn install_github_skill(
     source: String,
     host: HostKind,
-    root: String,
+    root: Option<String>,
     kind: ResourceKind,
     name: String,
 ) -> Result<(), String> {
+    let root = root
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| default_host_root(host))
+        .ok_or_else(|| format!("No default {host} root is available"))?;
     install_github_resource(
         &source,
-        &HostRoot::new(host, expand_home(PathBuf::from(root))),
+        &HostRoot::new(host, expand_home(root)),
         kind,
         &name,
     )
@@ -334,12 +339,7 @@ async fn discover_market_source(
     resources: Vec<SkillResource>,
 ) -> Result<MarketResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (entries, warnings) = browse_market_v2(
-            &[source],
-            token.as_deref(),
-            false,
-            &resources,
-        );
+        let (entries, warnings) = browse_market_v2(&[source], token.as_deref(), false, &resources);
         Ok(MarketResult { entries, warnings })
     })
     .await
@@ -347,9 +347,7 @@ async fn discover_market_source(
 }
 
 #[tauri::command]
-fn discover_curated_catalog(
-    resources: Vec<SkillResource>,
-) -> Result<MarketResult, String> {
+fn discover_curated_catalog(resources: Vec<SkillResource>) -> Result<MarketResult, String> {
     let (entries, warnings) = browse_market_v2(&[], None, true, &resources);
     Ok(MarketResult { entries, warnings })
 }
@@ -383,31 +381,111 @@ fn update_github_skill(
 
 fn configured_roots(codex_root: Option<String>, claude_root: Option<String>) -> Vec<HostRoot> {
     let mut roots = Vec::new();
-    if let Some(root) = codex_root
-        .or_else(|| std::env::var("CODEX_HOME").ok())
-        .or_else(|| home_relative(".codex"))
-    {
-        roots.push(HostRoot::new(
-            HostKind::Codex,
-            expand_home(PathBuf::from(root)),
-        ));
-    }
-    if let Some(root) = claude_root
-        .or_else(|| std::env::var("CLAUDE_HOME").ok())
-        .or_else(|| home_relative(".claude"))
-    {
-        roots.push(HostRoot::new(
-            HostKind::Claude,
-            expand_home(PathBuf::from(root)),
-        ));
-    }
+    roots.extend(configured_host_roots(HostKind::Codex, codex_root));
+    roots.extend(configured_host_roots(HostKind::Claude, claude_root));
     roots
 }
 
-fn home_relative(child: &str) -> Option<String> {
+fn configured_host_roots(host: HostKind, explicit_root: Option<String>) -> Vec<HostRoot> {
+    if let Some(root) = explicit_root.filter(|root| !root.trim().is_empty()) {
+        return vec![HostRoot::new(host, expand_home(PathBuf::from(root)))];
+    }
+
+    let env_name = match host {
+        HostKind::Codex => "CODEX_HOME",
+        HostKind::Claude => "CLAUDE_HOME",
+    };
+    if let Ok(root) = std::env::var(env_name) {
+        if !root.trim().is_empty() {
+            return vec![HostRoot::new(host, expand_home(PathBuf::from(root)))];
+        }
+    }
+
+    default_host_root_candidates(host)
+        .into_iter()
+        .map(|root| HostRoot::new(host, root))
+        .collect()
+}
+
+fn default_host_root(host: HostKind) -> Option<PathBuf> {
+    let env_name = match host {
+        HostKind::Codex => "CODEX_HOME",
+        HostKind::Claude => "CLAUDE_HOME",
+    };
+    if let Ok(root) = std::env::var(env_name) {
+        if !root.trim().is_empty() {
+            return Some(expand_home(PathBuf::from(root)));
+        }
+    }
+    default_host_root_candidates(host).into_iter().next()
+}
+
+fn default_host_root_candidates(host: HostKind) -> Vec<PathBuf> {
+    let (dot_dir, app_names): (&str, &[&str]) = match host {
+        HostKind::Codex => (".codex", &["Codex", "codex"]),
+        HostKind::Claude => (".claude", &["Claude", "claude"]),
+    };
+    let mut candidates = Vec::new();
+    if let Some(home) = user_home_dir() {
+        candidates.push(home.join(dot_dir));
+        #[cfg(target_os = "macos")]
+        {
+            for app_name in app_names {
+                candidates.push(
+                    home.join("Library")
+                        .join("Application Support")
+                        .join(app_name),
+                );
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            for app_name in app_names {
+                candidates.push(home.join(".config").join(app_name));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for env_name in ["APPDATA", "LOCALAPPDATA"] {
+            if let Ok(base) = std::env::var(env_name) {
+                for app_name in app_names {
+                    candidates.push(PathBuf::from(&base).join(app_name));
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        if let Ok(base) = std::env::var("XDG_CONFIG_HOME") {
+            for app_name in app_names {
+                candidates.push(PathBuf::from(&base).join(app_name));
+            }
+        }
+    }
+
+    dedupe_paths(candidates)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+fn user_home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
-        .map(|home| PathBuf::from(home).join(child).display().to_string())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(PathBuf::from)
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -415,11 +493,16 @@ fn expand_home(path: PathBuf) -> PathBuf {
         return path;
     };
     if raw == "~" {
-        return std::env::var("HOME").map(PathBuf::from).unwrap_or(path);
+        return user_home_dir().unwrap_or(path);
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("~\\") {
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
         }
     }
     path
@@ -558,11 +641,14 @@ fn push_resource(
 fn is_supported_resource(path: &Path, host: HostKind, kind: ResourceKind) -> bool {
     match (host, kind) {
         (_, ResourceKind::Skill) => path.join("SKILL.md").is_file(),
-        (HostKind::Codex, ResourceKind::Plugin) => path.join(".codex-plugin/plugin.json").is_file()
-            || path.join(".claude-plugin/plugin.json").is_file()
-            || path.join("plugin.json").is_file(),
-        (HostKind::Claude, ResourceKind::Plugin) => path.join(".claude-plugin/plugin.json").is_file()
-            || path.join("plugin.json").is_file(),
+        (HostKind::Codex, ResourceKind::Plugin) => {
+            path.join(".codex-plugin/plugin.json").is_file()
+                || path.join(".claude-plugin/plugin.json").is_file()
+                || path.join("plugin.json").is_file()
+        }
+        (HostKind::Claude, ResourceKind::Plugin) => {
+            path.join(".claude-plugin/plugin.json").is_file() || path.join("plugin.json").is_file()
+        }
         (_, ResourceKind::Unknown) => false,
     }
 }
@@ -700,19 +786,31 @@ fn update_status_for(source_kind: SourceKind) -> &'static str {
 }
 
 fn is_native_resource(path: &Path) -> bool {
-    let raw = path.to_string_lossy();
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|window| window[0] == "skills" && window[1] == ".system")
-        || raw.contains("/openai-bundled/")
-        || raw.contains("/openai-primary-runtime/")
+    path_has_component_window(path, &["skills", ".system"])
+        || path_has_component(path, "openai-bundled")
+        || path_has_component(path, "openai-primary-runtime")
 }
 
 fn is_registry_resource(path: &Path) -> bool {
-    let raw = path.to_string_lossy();
-    raw.contains("/openai-curated/") || raw.contains("/openai-curated-remote/")
+    path_has_component(path, "openai-curated") || path_has_component(path, "openai-curated-remote")
+}
+
+fn path_has_component(path: &Path, expected: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy() == expected)
+}
+
+fn path_has_component_window(path: &Path, expected: &[&str]) -> bool {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    components.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| left.as_ref() == *right)
+    })
 }
 
 fn find_github_remote(path: &Path) -> Option<String> {
@@ -1090,7 +1188,10 @@ fn discover_repo_skill_candidates(
     let github_ref = parse_github_ref(source)?;
     let client = market_discovery_http_client()?;
 
-    let branch = github_ref.branch.clone().unwrap_or_else(|| "main".to_string());
+    let branch = github_ref
+        .branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
 
     let stars = token
         .filter(|token| !token.trim().is_empty())
@@ -1273,13 +1374,8 @@ fn discover_repo_skill_candidates_from_archive(
         discover_repo_skill_candidates_from_dir(github_ref, &extracted_root, &branch, stars)
     })();
     let _ = fs::remove_dir_all(&staging);
-    result.map_err(|error| {
-        SkillHubError::Io(format!(
-            "{}: {}",
-            normalize_github_url(source),
-            error
-        ))
-    })
+    result
+        .map_err(|error| SkillHubError::Io(format!("{}: {}", normalize_github_url(source), error)))
 }
 
 fn discover_repo_skill_candidates_from_dir(
@@ -1541,7 +1637,11 @@ fn plugin_manifest_resource_dir(path: &str) -> Option<String> {
     ) {
         return Some(String::new());
     }
-    for suffix in ["/.claude-plugin/plugin.json", "/.codex-plugin/plugin.json", "/plugin.json"] {
+    for suffix in [
+        "/.claude-plugin/plugin.json",
+        "/.codex-plugin/plugin.json",
+        "/plugin.json",
+    ] {
         if let Some(dir) = path.strip_suffix(suffix) {
             return Some(dir.to_string());
         }
@@ -2153,10 +2253,9 @@ pub struct SystemTrash;
 
 impl Trash for SystemTrash {
     fn trash(&mut self, path: &Path) -> HubResult<()> {
-        let home = std::env::var("HOME").map_err(|_| {
-            SkillHubError::TrashFailed("HOME is required to use the system trash".to_string())
-        })?;
-        let trash_dir = PathBuf::from(home).join(".Trash");
+        let trash_dir = system_trash_dir()?;
+        fs::create_dir_all(&trash_dir)
+            .map_err(|error| SkillHubError::TrashFailed(error.to_string()))?;
         if !trash_dir.is_dir() {
             return Err(SkillHubError::TrashFailed(
                 "system trash directory is unavailable".to_string(),
@@ -2172,6 +2271,38 @@ impl Trash for SystemTrash {
             suffix += 1;
         }
         fs::rename(path, target).map_err(|error| SkillHubError::TrashFailed(error.to_string()))
+    }
+}
+
+fn system_trash_dir() -> HubResult<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = user_home_dir().ok_or_else(|| {
+            SkillHubError::TrashFailed("HOME is required to use the system trash".to_string())
+        })?;
+        Ok(home.join(".Trash"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = user_home_dir().ok_or_else(|| {
+            SkillHubError::TrashFailed("HOME is required to use the system trash".to_string())
+        })?;
+        if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(data_home).join("Trash").join("files"));
+        }
+        Ok(home.join(".local/share/Trash/files"))
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(base) = std::env::var("LOCALAPPDATA") {
+            return Ok(PathBuf::from(base).join("Skill Hub").join("Trash"));
+        }
+        let home = user_home_dir().ok_or_else(|| {
+            SkillHubError::TrashFailed("USERPROFILE is required to use the app trash".to_string())
+        })?;
+        Ok(home.join("AppData/Local/Skill Hub/Trash"))
     }
 }
 
@@ -2338,6 +2469,7 @@ mod tests {
             .all(|warning| !warning.contains(".env") && !warning.contains("token")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn adapter_scans_nested_and_linked_skills_without_failing_root_containment() {
         let root = temp_root("linked-scan-root");
@@ -2892,9 +3024,9 @@ mod tests {
         assert!(candidates.iter().any(|candidate| {
             candidate.name == "github-plugin" && candidate.kind == ResourceKind::Plugin
         }));
-        assert!(candidates.iter().any(|candidate| {
-            candidate.name == "pdf" && candidate.kind == ResourceKind::Skill
-        }));
+        assert!(candidates
+            .iter()
+            .any(|candidate| { candidate.name == "pdf" && candidate.kind == ResourceKind::Skill }));
         assert!(!candidates
             .iter()
             .any(|candidate| candidate.name == "internal-plugin-skill"));

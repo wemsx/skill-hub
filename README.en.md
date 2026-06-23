@@ -4,7 +4,7 @@
 
 ![Skill Hub desktop app preview](docs/images/skill-hub-preview.png)
 
-Skill Hub is a macOS desktop app for managing local Codex and Claude skills and plugins. It scans local resource folders, classifies where each resource came from, and helps distinguish official, GitHub-backed, and local skills.
+Skill Hub is a cross-platform desktop app for managing local Codex and Claude skills and plugins on macOS, Windows, and Linux. It scans local resource folders, classifies where each resource came from, and helps distinguish official, GitHub-backed, and local skills.
 
 ## Features
 
@@ -25,16 +25,21 @@ Skill Hub is a macOS desktop app for managing local Codex and Claude skills and 
 - Manual extra skill path scanning.
 - Language setting for English and Chinese.
 - Dark and light themes.
-- Local install workflow that replaces `/Applications/Skill-Hub.app` without reinstalling through a DMG each iteration.
+- macOS local install workflow that replaces `/Applications/Skill-Hub.app` without reinstalling through a DMG each iteration.
 
 ## How Scanning Works
 
-Skill Hub scans these default roots:
+Skill Hub scans common Codex/Claude roots for the current operating system. Different devices can use different install paths; environment variables `CODEX_HOME` and `CLAUDE_HOME` always take precedence.
+
+Default candidates include:
 
 - `~/.codex/skills`
 - `~/.codex/plugins`
 - `~/.claude/skills`
 - `~/.claude/plugins`
+- macOS: `~/Library/Application Support/Codex`, `~/Library/Application Support/Claude`
+- Windows: `%APPDATA%\Codex`, `%LOCALAPPDATA%\Codex`, `%APPDATA%\Claude`, `%LOCALAPPDATA%\Claude`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/codex`, `${XDG_CONFIG_HOME:-~/.config}/claude`
 
 You can add extra skill roots in Settings. A directory is treated as a skill when it contains `SKILL.md`. A Codex plugin is detected by `.codex-plugin/plugin.json`; a Claude plugin is detected by `plugin.json`.
 
@@ -145,7 +150,7 @@ cd app
 npm run release:latest-json
 ```
 
-The script uses the current `tauri.conf.json` version and updater signature to generate `src-tauri/target/release/bundle/macos/latest.json`, which can be uploaded to the GitHub Release alongside `Skill-Hub.app.tar.gz` and its `.sig` file.
+The script uses the current `tauri.conf.json` version and updater signatures to generate `latest.json`. For a local single-machine build it reads the current platform's updater artifact; in the GitHub Actions release flow it merges Windows, Linux, and macOS artifacts into one `latest.json` with multiple `platforms` entries.
 
 ## Development
 
@@ -153,7 +158,7 @@ Prerequisites:
 
 - Node.js
 - Rust
-- macOS for Tauri app packaging
+- Windows packaging requires a Windows runner, Linux packaging requires a Linux runner, and macOS packaging requires a macOS runner. The bundled GitHub Actions release workflow builds on each operating system.
 
 Install dependencies:
 
@@ -185,7 +190,7 @@ Build the app bundle:
 npm run build:app
 ```
 
-Install the latest local build into `/Applications`:
+On macOS, install the latest local build into `/Applications`:
 
 ```bash
 npm run install:local
@@ -199,6 +204,29 @@ Build the desktop release artifacts:
 
 ```bash
 npm run build:desktop
+```
+
+The local build script is cross-platform. It reads the updater signing key from `TAURI_SIGNING_PRIVATE_KEY`; if that is unset, it tries `TAURI_SIGNING_PRIVATE_KEY_PATH`, defaulting to `~/.skill-hub/updater.key`.
+
+## Publishing to GitHub Releases
+
+The repository includes `.github/workflows/release.yml`. Pushing a version tag such as `v0.4.0`, or manually triggering the workflow, will:
+
+1. Build the Tauri app on Ubuntu, Windows, and macOS runners.
+2. Upload installers, updater bundles, and `.sig` signature files for each platform.
+3. Merge all `.sig` files into one `latest.json`.
+4. Publish everything to the same GitHub Release.
+
+Configure these repository secrets first:
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the private key is password-protected
+
+Create a release manually:
+
+```bash
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## Repository Layout
