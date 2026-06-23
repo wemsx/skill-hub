@@ -1867,7 +1867,7 @@ label {
   border-radius: var(--radius-md);
   display: grid;
   gap: 4px;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 4px;
 }
 
@@ -1877,6 +1877,7 @@ label {
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   font-weight: 700;
+  min-width: 0;
   min-height: 36px;
   transition: all 0.18s var(--ease);
 }
