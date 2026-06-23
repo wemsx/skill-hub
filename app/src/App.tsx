@@ -17,7 +17,7 @@ import "./App.css";
 
 type NavView = "overview" | "skills" | "plugins" | "market" | "settings";
 type Language = "en" | "zh";
-type Theme = "dark" | "light";
+type Theme = "dark" | "light" | "system";
 type ResourceViewMode = "list" | "grid";
 type MarketKindFilter = "skill" | "plugin";
 type AppUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
@@ -146,6 +146,7 @@ function App({
   });
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(0);
+  const [systemTheme, setSystemTheme] = useState<Exclude<Theme, "system">>(() => getSystemTheme());
 
   function addToast(message: string, type: ToastType = "info") {
     const id = ++toastIdRef.current;
@@ -167,12 +168,27 @@ function App({
   const settingsPanelRef = useRef<HTMLElement | null>(null);
   const appUpdateRef = useRef<unknown | null>(null);
   const text = labels[settings.language];
+  const resolvedTheme = settings.theme === "system" ? systemTheme : settings.theme;
 
   useEffect(() => {
     if (!initialResources) {
       refreshInventory();
     }
   }, [initialResources, settings.extraSkillPaths]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const applyTheme = () => setSystemTheme(media.matches ? "dark" : "light");
+
+    applyTheme();
+    media.addEventListener?.("change", applyTheme);
+    media.addListener?.(applyTheme);
+
+    return () => {
+      media.removeEventListener?.("change", applyTheme);
+      media.removeListener?.(applyTheme);
+    };
+  }, []);
 
   useEffect(() => {
     if (initialResources || !isTauriRuntime()) return;
@@ -183,9 +199,10 @@ function App({
   }, [initialResources]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = settings.theme;
+    document.documentElement.dataset.theme = resolvedTheme;
+    document.documentElement.style.colorScheme = resolvedTheme;
     saveSettings(settings);
-  }, [settings]);
+  }, [resolvedTheme, settings]);
 
   useEffect(() => {
     setMarketVisibleCount(MARKET_PAGE_SIZE);
@@ -1034,7 +1051,7 @@ function App({
               <div className="market-loading-area">
                 <RoseLoader
                   size={180}
-                  accent={settings.theme === "light" ? "#2563eb" : "#38bdf8"}
+                  accent={resolvedTheme === "light" ? "#2563eb" : "#38bdf8"}
                 />
                 <SourceStatusPanel countLabel={text.marketItems} states={sourceStates} />
               </div>
@@ -1180,14 +1197,14 @@ function App({
                   <p>{text.themeHint}</p>
                 </div>
                 <div className="segmented" role="group" aria-label={text.theme}>
-                  {(["dark", "light"] as Theme[]).map((theme) => (
+                  {(["dark", "light", "system"] as Theme[]).map((theme) => (
                     <button
                       className={settings.theme === theme ? "active" : ""}
                       key={theme}
                       onClick={() => setSettings((current) => ({ ...current, theme }))}
                       type="button"
                     >
-                      {theme === "dark" ? text.dark : text.light}
+                      {theme === "dark" ? text.dark : theme === "light" ? text.light : text.system}
                     </button>
                   ))}
                 </div>
@@ -1891,6 +1908,13 @@ function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+function getSystemTheme(): Exclude<Theme, "system"> {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return "dark";
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 type Labels = (typeof labels)[Language];
 
 function SourceBadge({ sourceKind, text }: { sourceKind: SkillResource["sourceKind"]; text: Labels }) {
@@ -2001,7 +2025,7 @@ function compactHomePath(path: string) {
 function loadSettings(): AppSettings {
   const defaults: AppSettings = {
     language: "en",
-    theme: "dark",
+    theme: "system",
     extraSkillPaths: [],
     githubMatchingEnabled: false,
     githubIndexUrls: [],
@@ -2017,7 +2041,7 @@ function loadSettings(): AppSettings {
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
     return {
       language: parsed.language === "zh" ? "zh" : "en",
-      theme: parsed.theme === "light" ? "light" : "dark",
+      theme: parsed.theme === "light" || parsed.theme === "dark" || parsed.theme === "system" ? parsed.theme : "system",
       extraSkillPaths: Array.isArray(parsed.extraSkillPaths)
         ? parsed.extraSkillPaths.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
         : [],
@@ -2316,6 +2340,7 @@ const labels: Record<Language, {
   summary: string;
   theme: string;
   themeHint: string;
+  system: string;
   type: string;
   unknown: string;
   updateStatus: string;
@@ -2513,7 +2538,8 @@ const labels: Record<Language, {
     },
     summary: "Summary",
     theme: "Theme",
-    themeHint: "Switch the app surface without changing scanned resources.",
+    themeHint: "Switch the app surface without changing scanned resources. System follows your OS theme.",
+    system: "System",
     type: "Type",
     unknown: "Unknown",
     updateStatus: "Update status",
@@ -2718,7 +2744,8 @@ const labels: Record<Language, {
     },
     summary: "摘要",
     theme: "主题",
-    themeHint: "切换界面外观，不影响已经扫描到的资源。",
+    themeHint: "切换界面外观，不影响已经扫描到的资源。跟随系统会自动使用当前系统亮色/暗色模式。",
+    system: "跟随系统",
     type: "类型",
     unknown: "未知",
     updateStatus: "更新状态",
