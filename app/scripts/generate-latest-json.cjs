@@ -53,10 +53,29 @@ function platformKeyForAsset(filePath, fallback = platformKeyForCurrent()) {
   if (lower.includes(".appimage")) {
     return `linux-${arch}`;
   }
-  if (lower.endsWith(".msi.zip") || lower.endsWith(".nsis.zip") || lower.endsWith(".exe.zip")) {
+  if (
+    lower.endsWith(".msi") ||
+    lower.endsWith(".msi.zip") ||
+    lower.endsWith(".nsis.zip") ||
+    lower.endsWith(".exe") ||
+    lower.endsWith(".exe.zip")
+  ) {
     return `windows-${arch}`;
   }
+  if (lower.endsWith(".deb") || lower.endsWith(".rpm")) {
+    return `linux-${arch}`;
+  }
   return fallback;
+}
+
+function updaterPriority(fileName) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".app.tar.gz")) return 100;
+  if (lower.includes(".appimage")) return 100;
+  if (lower.endsWith("-setup.exe") || lower.endsWith(".nsis.zip")) return 100;
+  if (lower.endsWith(".msi") || lower.endsWith(".msi.zip")) return 80;
+  if (lower.endsWith(".deb") || lower.endsWith(".rpm")) return 40;
+  return 10;
 }
 
 function releaseUrl(repo, version, fileName) {
@@ -113,8 +132,20 @@ function main() {
   }
 
   const platforms = {};
+  const selected = {};
   for (const artifact of artifacts) {
-    platforms[artifact.platform] = {
+    const current = selected[artifact.platform];
+    if (current && current.priority >= updaterPriority(artifact.assetName)) {
+      continue;
+    }
+    selected[artifact.platform] = {
+      artifact,
+      priority: updaterPriority(artifact.assetName),
+    };
+  }
+
+  for (const [platformName, { artifact }] of Object.entries(selected)) {
+    platforms[platformName] = {
       signature: fs.readFileSync(artifact.signaturePath, "utf8").trim(),
       url: releaseUrl(repo, version, artifact.assetName),
     };
