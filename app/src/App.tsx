@@ -124,7 +124,7 @@ function App({
   const [resourceViewMode, setResourceViewMode] = useState<ResourceViewMode>("list");
   const [installingUrl, setInstallingUrl] = useState<string | null>(null);
   const [marketSort, setMarketSort] = useState<"stars" | "name" | "hotness">("hotness");
-  const [marketKind, setMarketKind] = useState<MarketKindFilter>("plugin");
+  const [marketKind, setMarketKind] = useState<MarketKindFilter>("skill");
   const [newMarketSource, setNewMarketSource] = useState("");
   const [showMarketSourceEntry, setShowMarketSourceEntry] = useState(false);
   const [discovering, setDiscovering] = useState(false);
@@ -236,6 +236,13 @@ function App({
         );
     const sorted = [...filtered].sort((a, b) => {
       if (marketSort === "name") return a.name.localeCompare(b.name);
+      if (marketSort === "hotness") {
+        return (
+          (b.hotness ?? 0) - (a.hotness ?? 0) ||
+          (b.stars ?? 0) - (a.stars ?? 0) ||
+          a.name.localeCompare(b.name)
+        );
+      }
       return (b.stars ?? 0) - (a.stars ?? 0) || a.name.localeCompare(b.name);
     });
     return sorted;
@@ -861,7 +868,7 @@ function App({
         {activeNav === "market" ? (
           <section className="market-panel" aria-label={text.nav.market}>
             <div className="market-kind-tabs" aria-label={text.marketKind} role="tablist">
-              {(["plugin", "skill"] as const).map((kind) => (
+              {(["skill", "plugin"] as const).map((kind) => (
                 <button
                   aria-selected={marketKind === kind}
                   className={marketKind === kind ? "active" : ""}
@@ -936,8 +943,9 @@ function App({
                 <select
                   aria-label={text.sortBy}
                   value={marketSort}
-                  onChange={(event) => setMarketSort(event.currentTarget.value as "stars" | "name")}
+                  onChange={(event) => setMarketSort(event.currentTarget.value as "stars" | "name" | "hotness")}
                 >
+                  <option value="hotness">{text.sortHotness}</option>
                   <option value="stars">{text.sortStars}</option>
                   <option value="name">{text.sortName}</option>
                 </select>
@@ -2220,6 +2228,7 @@ const labels: Record<Language, {
   sortBy: string;
   sortStars: string;
   sortName: string;
+  sortHotness: string;
   starsHint: string;
   originLabels: Record<string, string>;
   githubTokenTitle: string;
@@ -2391,6 +2400,7 @@ const labels: Record<Language, {
     sortBy: "Sort by",
     sortStars: "Stars (leaderboard)",
     sortName: "Name",
+    sortHotness: "Hotness",
     starsHint: "Stars of the source repository (GitHub has no per-skill metric).",
     originLabels: {
       official: "Official",
@@ -2595,6 +2605,7 @@ const labels: Record<Language, {
     sortBy: "排序",
     sortStars: "Star 数(排行榜)",
     sortName: "名称",
+    sortHotness: "热度",
     starsHint: "来源仓库的 star 数(GitHub 没有 skill 粒度的热度指标)。",
     originLabels: {
       official: "官方",

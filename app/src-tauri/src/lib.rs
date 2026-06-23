@@ -3290,13 +3290,30 @@ mod tests {
 
     #[test]
     fn browse_market_v2_includes_curated_catalog_offline() {
-        // No sources, curated on: must return the 17 official skills with no
-        // network access at all.
+        // No sources, curated on: must return the 17 built-in index skills with
+        // no network access at all. The built-in index replaced the old
+        // hardcoded curated list, so origin is "index" (not "official").
         let (entries, warnings) = browse_market_v2(&[], None, true, &[], None, None);
         assert_eq!(entries.len(), 17);
         assert!(warnings.is_empty());
-        assert!(entries.iter().all(|entry| entry.origin == "official"));
+        assert!(entries.iter().all(|entry| entry.origin == "index"));
+        assert!(entries.iter().all(|entry| entry.kind == ResourceKind::Skill));
         assert!(entries.iter().any(|entry| entry.name == "pdf"));
+    }
+
+    #[test]
+    fn discover_builtin_index_returns_all_skills() {
+        // L1: discover_builtin_index must return all 17 built-in skills
+        // immediately with no warnings, even when no resources are installed.
+        let result = discover_builtin_index(vec![]).expect("builtin index should load");
+        assert_eq!(result.entries.len(), 17);
+        assert!(result.warnings.is_empty());
+        assert!(result.entries.iter().all(|entry| entry.kind == ResourceKind::Skill));
+        assert!(result.entries.iter().all(|entry| !entry.installed));
+        assert!(result.entries.iter().all(|entry| entry.origin == "index"));
+        // Hotness and stars should be populated from the index file.
+        assert!(result.entries.iter().all(|entry| entry.hotness.is_some()));
+        assert!(result.entries.iter().all(|entry| entry.stars.is_some()));
     }
 
     #[test]
